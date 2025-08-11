@@ -1,73 +1,274 @@
-# Welcome to your Lovable project
+# CyberGuard: AI-Powered Behavioral Micro-Fingerprinting Cybersecurity System
 
-## Project info
+A complete, production-ready cybersecurity system that detects anomalous user behavior using PyTorch autoencoder models and provides real-time risk scoring through a React dashboard.
 
-**URL**: https://lovable.dev/projects/0c8ec815-f3b5-4303-802d-13f1c42f435f
+## 🚀 Quick Start
 
-## How can I edit this code?
+### Prerequisites
+- Node.js 16+
+- Python 3.8+
+- MongoDB 6.0+
+- Docker & Docker Compose (optional)
 
-There are several ways of editing your application.
+### Option 1: Docker Setup (Recommended)
+```bash
+# Clone and start all services
+git clone <your-repo>
+cd cyberguard-system
 
-**Use Lovable**
+# Start with Docker Compose
+docker-compose up -d
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/0c8ec815-f3b5-4303-802d-13f1c42f435f) and start prompting.
+# Seed the database
+docker exec cyberguard-backend npm run seed
 
-Changes made via Lovable will be committed automatically to this repo.
+# Generate sample training data and train global model
+docker exec cyberguard-ml python generate_sample_data.py --output global_data.csv --samples 2000
+docker exec cyberguard-ml python train_model.py --user-id global --data-path global_data.csv --epochs 50
+```
 
-**Use your preferred IDE**
+### Option 2: Local Development Setup
+```bash
+# 1. Start MongoDB
+mongod --dbpath ./data/db
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+# 2. Setup Backend
+cd backend
+npm install
+cp .env.example .env
+# Edit .env with your settings
+npm run seed
+npm run dev
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
+# 3. Setup ML Service
+cd ../ml_service
+pip install -r requirements.txt
+# Generate sample data and train global model
+python generate_sample_data.py --output global_data.csv --samples 2000
+python train_model.py --user-id global --data-path global_data.csv --epochs 50
+python ml_service.py
 
-Follow these steps:
-
-```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
-
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
-
-# Step 3: Install the necessary dependencies.
-npm i
-
-# Step 4: Start the development server with auto-reloading and an instant preview.
+# 4. Start Frontend (existing Lovable project)
 npm run dev
 ```
 
-**Edit a file directly in GitHub**
+## 🏗️ Architecture
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+### Frontend (React + TypeScript + Tailwind)
+- **Pages**: Login, Dashboard, Session Monitor, User Profile, Settings
+- **Real-time Updates**: WebSocket + polling for live risk scores
+- **Authentication**: JWT stored in localStorage
 
-**Use GitHub Codespaces**
+### Backend (Node.js + Express + MongoDB)
+- **RESTful API** with modular routes and controllers
+- **WebSocket Integration** via Socket.IO for real-time updates
+- **JWT Authentication** with role-based access control
+- **MongoDB Models**: Users, Events, Sessions, Alerts, RiskLogs
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+### ML Microservice (Python + FastAPI + PyTorch)
+- **PyTorch Autoencoders** for per-user anomaly detection
+- **Hot-reload Model Manager** watches models/ directory
+- **Feature Extraction** from behavioral events (typing, mouse, network)
+- **Risk Scoring**: Reconstruction error → 0-100 risk score
 
-## What technologies are used for this project?
+## 📊 Key Features
 
-This project is built with:
+### Behavioral Monitoring
+- **Keystroke Dynamics**: Hold time, flight time, typing speed patterns
+- **Mouse Behavior**: Movement speed, acceleration, click patterns
+- **Application Usage**: Context switches, focus time (hashed for privacy)
+- **Network Latency**: Connection patterns and response times
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+### AI-Powered Detection
+- **Per-User Models**: Individual autoencoder trained on user's normal behavior
+- **Global Fallback**: Default model for new users or missing models
+- **Real-time Inference**: Sub-second risk score calculation
+- **Hot Model Reload**: Automatic detection of new/updated models
 
-## How can I deploy this project?
+### Security & Privacy
+- **No Raw Data Storage**: Only aggregated metrics and timing data
+- **Encrypted Communications**: HTTPS in production, JWT authentication
+- **Consent Management**: User consent tracking and data controls
+- **Hashed Identifiers**: Application names and sensitive data hashed
 
-Simply open [Lovable](https://lovable.dev/projects/0c8ec815-f3b5-4303-802d-13f1c42f435f) and click on Share -> Publish.
+## 🔌 API Endpoints
 
-## Can I connect a custom domain to my Lovable project?
+### Authentication
+```
+POST /api/auth/login     # Login with username/password
+POST /api/auth/logout    # Logout
+GET  /api/auth/verify    # Verify JWT token
+```
 
-Yes, you can!
+### Event Ingestion
+```
+POST /api/events         # Submit behavioral events batch
+GET  /api/events/:sessionId  # Get session events
+```
 
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
+### Risk Analysis
+```
+GET  /api/risk/:userId         # Get latest risk score
+GET  /api/risk/:userId/history # Get risk history
+```
 
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/tips-tricks/custom-domain#step-by-step-guide)
+### Management
+```
+GET  /api/dashboard      # Dashboard data (paginated)
+GET  /api/alerts         # Security alerts
+POST /api/alerts         # Create alert
+GET  /api/sessions       # Recent sessions
+POST /api/train/:userId  # Trigger model training
+```
+
+### ML Service (Internal)
+```
+POST /infer             # Risk inference from events
+GET  /models            # List available models
+GET  /health            # Service health check
+```
+
+## 🧠 Machine Learning Pipeline
+
+### 1. Feature Extraction
+```python
+# Extract 15 behavioral features from events
+features = extract_features_from_events(events)
+# Features: typing speed, hold times, mouse patterns, etc.
+```
+
+### 2. Model Training
+```bash
+# Train user-specific model
+python train_model.py --user-id user123 --data-path user_data.csv --epochs 100
+
+# Train global fallback model
+python train_model.py --user-id global --data-path all_users_data.csv --epochs 200
+```
+
+### 3. Real-time Inference
+```python
+# Autoencoder reconstruction error → risk score
+risk_score = model_manager.infer_risk(user_id, session_id, events)
+# Output: 0-100 risk score with factor analysis
+```
+
+### 4. Hot Model Reload
+- Models automatically reload when `.pt` files change in `models/` directory
+- Zero-downtime model updates for production systems
+- Thread-safe model caching and fallback handling
+
+## 🔧 Configuration
+
+### Backend Environment (.env)
+```bash
+PORT=5000
+MONGODB_URI=mongodb://localhost:27017/cyberguard
+JWT_SECRET=your-256-bit-secret-key
+ML_SERVICE_URL=http://localhost:8001
+ML_API_KEY=your-ml-api-key
+FRONTEND_URL=http://localhost:5173
+```
+
+### ML Service Environment
+```bash
+ML_API_KEY=your-ml-api-key
+HOST=0.0.0.0
+PORT=8001
+```
+
+## 📈 Model Performance
+
+### Training Metrics
+- **Reconstruction Loss**: MSE between input and reconstructed features
+- **Validation Split**: 20% for model validation during training
+- **Early Stopping**: Prevents overfitting with patience-based learning rate reduction
+
+### Risk Score Mapping
+- **0-20**: Reconstruction error < 0.01 (Normal behavior)
+- **20-50**: Error 0.01-0.05 (Slight deviations)
+- **50-80**: Error 0.05-0.15 (Notable anomalies)
+- **80-100**: Error > 0.15 (High-risk behavior)
+
+## 🚨 Alerting System
+
+### Alert Types
+- **Anomaly Detected**: Behavioral pattern deviations
+- **Login from New Device**: Unrecognized device fingerprints
+- **Behavioral Deviation**: Significant changes from baseline
+- **Suspicious Activity**: High-risk score patterns
+
+### Alert Severities
+- **Low**: Minor deviations, informational
+- **Medium**: Moderate risk, monitoring recommended
+- **High**: Significant anomaly, action required
+- **Critical**: Immediate security concern
+
+## 🔒 Security Considerations
+
+### Data Privacy
+- All keystroke data is aggregated into timing metrics only
+- Application names are cryptographically hashed
+- User consent is required and tracked
+- Data retention policies configurable per deployment
+
+### Model Security
+- Models trained only on consented user data
+- No personally identifiable information in model artifacts
+- Model files include version control and training metadata
+
+## 🛠️ Development
+
+### Adding New Features
+```python
+# 1. Add new behavioral feature to feature_extractor.py
+FEATURE_SCHEMA['new_feature'] = next_index
+
+# 2. Update extraction logic
+def extract_features_from_events(events):
+    # ... existing logic
+    features[FEATURE_SCHEMA['new_feature']] = compute_new_feature(events)
+```
+
+### Testing
+```bash
+# Backend tests
+cd backend && npm test
+
+# ML service tests  
+cd ml_service && python -m pytest
+
+# Frontend tests
+npm test
+```
+
+## 📚 Documentation
+
+- **API Documentation**: Available at `/docs` when backend is running
+- **Model Architecture**: See `ml_service/train_model.py` for autoencoder details
+- **Feature Schema**: Defined in `ml_service/feature_extractor.py`
+
+## 🚀 Production Deployment
+
+### Environment Setup
+1. Configure MongoDB replica set for high availability
+2. Set up proper TLS certificates for HTTPS
+3. Configure environment variables for production
+4. Set up monitoring and alerting for all services
+
+### Scaling Considerations
+- Backend can be horizontally scaled with load balancer
+- ML service can run multiple instances for high throughput
+- MongoDB can be sharded for large-scale deployments
+- Model storage can be moved to distributed filesystem
+
+---
+
+## Default Login Credentials
+
+**Username**: `admin`  
+**Password**: `password123`
+
+The system includes pre-seeded demo data with sample alerts, sessions, and user profiles for immediate testing.
+
+Built with ❤️ for cybersecurity professionals who need AI-powered behavioral analytics.

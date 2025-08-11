@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:6.0
+    container_name: cyberguard-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: cyberguard
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - cyberguard-network
+
+  backend:
+    build: ./backend
+    container_name: cyberguard-backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - MONGODB_URI=mongodb://mongodb:27017/cyberguard
+      - ML_SERVICE_URL=http://ml_service:8001
+      - FRONTEND_URL=http://localhost:5173
+    depends_on:
+      - mongodb
+      - ml_service
+    networks:
+      - cyberguard-network
+
+  ml_service:
+    build: ./ml_service
+    container_name: cyberguard-ml
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - ML_API_KEY=dev-ml-api-key-123
+      - HOST=0.0.0.0
+      - PORT=8001
+    volumes:
+      - ./ml_service/models:/app/models
+    networks:
+      - cyberguard-network
+
+  frontend:
+    build: .
+    container_name: cyberguard-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:5000
+    depends_on:
+      - backend
+    networks:
+      - cyberguard-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  cyberguard-network:
+    driver: bridge
