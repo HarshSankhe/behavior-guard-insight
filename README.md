@@ -1,6 +1,6 @@
-# CyberGuard: AI-Powered Behavioral Micro-Fingerprinting Cybersecurity System
+# CyberGuard - AI-Powered Behavioral Micro-Fingerprinting Cybersecurity System
 
-A complete, production-ready cybersecurity system that detects anomalous user behavior using PyTorch autoencoder models and provides real-time risk scoring through a React dashboard.
+A complete, production-ready cybersecurity system that detects anomalous user behavior through AI-powered behavioral micro-fingerprinting. The system uses PyTorch autoencoders to analyze typing patterns, mouse movements, application usage, and network behavior to produce real-time risk assessments.
 
 ## 🚀 Quick Start
 

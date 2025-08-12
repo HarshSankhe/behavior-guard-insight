@@ -1,8 +1,8 @@
 import axios from 'axios';
 
-// Base API configuration
+// Base API configuration  
 const api = axios.create({
-  baseURL: '/api', // This will be replaced with actual backend URL
+  baseURL: import.meta.env.VITE_API_URL || 'http://localhost:5000/api',
   timeout: 10000,
   headers: {
     'Content-Type': 'application/json',
