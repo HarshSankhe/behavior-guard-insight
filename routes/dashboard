@@ -1,0 +1,593 @@
+// routes/dashboard.js
+const express = require('express');
+const { User, Alert, Session, RiskLog } = require('../models');
+const { requireRole } = require('../middleware/auth');
+
+const router = express.Router();
+
+// Get dashboard overview
+router.get('/', async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const isAdmin = ['admin', 'analyst'].includes(req.user.role);
+
+    let dashboardData;
+
+    if (isAdmin) {
+      // Admin dashboard
+      dashboardData = await getAdminDashboard();
+    } else {
+      // User dashboard
+      dashboardData = await getUserDashboard(userId);
+    }
+
+    res.json(dashboardData);
+
+  } catch (error) {
+    console.error('Dashboard error:', error);
+    res.status(500).json({ error: 'Failed to load dashboard data' });
+  }
+});
+
+// Get user-specific dashboard data
+async function getUserDashboard(userId) {
+  const now = new Date();
+  const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const last7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  // Current risk score
+  const currentRisk = await RiskLog.findOne({ userId })
+    .sort({ timestamp: -1 })
+    .limit(1);
+
+  // Risk history for charts
+  const riskHistory = await RiskLog.find({
+    userId,
+    timestamp: { $gte: last24h }
+  }).sort({ timestamp: 1 });
+
+  // Recent alerts
+  const recentAlerts = await Alert.find({
+    userId,
+    createdAt: { $gte: last7d }
+  })
+  .sort({ createdAt: -1 })
+  .limit(5);
+
+  // Session statistics
+  const sessionStats = await Session.aggregate([
+    {
+      $match: {
+        userId,
+        startTime: { $gte: last7d }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        totalSessions: { $sum: 1 },
+        totalDuration: { $sum: '$duration' },
+        avgRiskScore: { $avg: '$averageRiskScore' },
+        maxRiskScore: { $max: '$maxRiskScore' }
+      }
+    }
+  ]);
+
+  return {
+    user: {
+      currentRiskScore: currentRisk?.riskScore || 0,
+      riskTrend: calculateRiskTrend(riskHistory),
+      lastActivity: currentRisk?.timestamp || null
+    },
+    alerts: {
+      total: recentAlerts.length,
+      unread: recentAlerts.filter(alert => alert.status === 'open').length,
+      recent: recentAlerts
+    },
+    sessions: sessionStats[0] || {
+      totalSessions: 0,
+      totalDuration: 0,
+      avgRiskScore: 0,
+      maxRiskScore: 0
+    },
+    charts: {
+      riskHistory: riskHistory.map(log => ({
+        timestamp: log.timestamp,
+        riskScore: log.riskScore,
+        factors: log.factors
+      }))
+    }
+  };
+}
+
+// Get admin dashboard data
+async function getAdminDashboard() {
+  const now = new Date();
+  const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const last7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  // System overview
+  const systemStats = await Promise.all([
+    User.countDocuments({ isActive: true }),
+    Session.countDocuments({ startTime: { $gte: last24h } }),
+    Alert.countDocuments({ createdAt: { $gte: last24h } }),
+    Alert.countDocuments({ 
+      createdAt: { $gte: last24h },
+      severity: { $in: ['high', 'critical'] }
+    })
+  ]);
+
+  // Risk distribution
+  const riskDistribution = await RiskLog.aggregate([
+    {
+      $match: {
+        timestamp: { $gte: last24h }
+      }
+    },
+    {
+      $bucket: {
+        groupBy: '$riskScore',
+        boundaries: [0, 20, 50, 80, 100],
+        default: 'other',
+        output: {
+          count: { $sum: 1 }
+        }
+      }
+    }
+  ]);
+
+  // Top risk users
+  const topRiskUsers = await RiskLog.aggregate([
+    {
+      $match: {
+        timestamp: { $gte: last24h }
+      }
+    },
+    {
+      $group: {
+        _id: '$userId',
+        avgRiskScore: { $avg: '$riskScore' },
+        maxRiskScore: { $max: '$riskScore' },
+        eventCount: { $sum: 1 }
+      }
+    },
+    {
+      $sort: { avgRiskScore: -1 }
+    },
+    {
+      $limit: 10
+    },
+    {
+      $lookup: {
+        from: 'users',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'user'
+      }
+    }
+  ]);
+
+  // Recent critical alerts
+  const criticalAlerts = await Alert.find({
+    severity: { $in: ['high', 'critical'] },
+    createdAt: { $gte: last7d }
+  })
+  .populate('userId', 'username email')
+  .sort({ createdAt: -1 })
+  .limit(10);
+
+  // Risk trends over time
+  const riskTrends = await RiskLog.aggregate([
+    {
+      $match: {
+        timestamp: { $gte: last7d }
+      }
+    },
+    {
+      $group: {
+        _id: {
+          date: { $dateToString: { format: '%Y-%m-%d', date: '$timestamp' } }
+        },
+        avgRiskScore: { $avg: '$riskScore' },
+        maxRiskScore: { $max: '$riskScore' },
+        userCount: { $addToSet: '$userId' }
+      }
+    },
+    {
+      $addFields: {
+        userCount: { $size: '$userCount' }
+      }
+    },
+    {
+      $sort: { '_id.date': 1 }
+    }
+  ]);
+
+  return {
+    overview: {
+      totalUsers: systemStats[0],
+      activeSessions: systemStats[1],
+      alertsToday: systemStats[2],
+      criticalAlerts: systemStats[3]
+    },
+    riskDistribution,
+    topRiskUsers,
+    criticalAlerts,
+    trends: riskTrends
+  };
+}
+
+function calculateRiskTrend(riskHistory) {
+  if (riskHistory.length < 2) return 'stable';
+  
+  const recent = riskHistory.slice(-5);
+  const older = riskHistory.slice(-10, -5);
+  
+  const recentAvg = recent.reduce((sum, log) => sum + log.riskScore, 0) / recent.length;
+  const olderAvg = older.length > 0 
+    ? older.reduce((sum, log) => sum + log.riskScore, 0) / older.length 
+    : recentAvg;
+  
+  const diff = recentAvg - olderAvg;
+  
+  if (diff > 5) return 'increasing';
+  if (diff < -5) return 'decreasing';
+  return 'stable';
+}
+
+// routes/alerts.js
+const alertsRouter = express.Router();
+
+// Get alerts
+alertsRouter.get('/', async (req, res) => {
+  try {
+    const { 
+      status = 'all', 
+      severity = 'all',
+      limit = 20,
+      skip = 0 
+    } = req.query;
+
+    const query = {};
+    
+    // Filter by user for non-admin users
+    if (!['admin', 'analyst'].includes(req.user.role)) {
+      query.userId = req.user._id;
+    }
+
+    if (status !== 'all') {
+      query.status = status;
+    }
+
+    if (severity !== 'all') {
+      query.severity = severity;
+    }
+
+    const alerts = await Alert.find(query)
+      .populate('userId', 'username email')
+      .populate('acknowledgedBy', 'username')
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(skip));
+
+    const totalAlerts = await Alert.countDocuments(query);
+
+    res.json({
+      alerts,
+      pagination: {
+        total: totalAlerts,
+        limit: parseInt(limit),
+        skip: parseInt(skip),
+        hasMore: totalAlerts > (parseInt(skip) + parseInt(limit))
+      }
+    });
+
+  } catch (error) {
+    console.error('Get alerts error:', error);
+    res.status(500).json({ error: 'Failed to retrieve alerts' });
+  }
+});
+
+// Create manual alert
+alertsRouter.post('/', requireRole(['admin', 'analyst']), async (req, res) => {
+  try {
+    const { userId, type, severity, title, description, metadata } = req.body;
+
+    const alert = new Alert({
+      userId,
+      type: type || 'manual',
+      severity,
+      title,
+      description,
+      metadata
+    });
+
+    await alert.save();
+    await alert.populate('userId', 'username email');
+
+    res.status(201).json(alert);
+
+  } catch (error) {
+    console.error('Create alert error:', error);
+    res.status(500).json({ error: 'Failed to create alert' });
+  }
+});
+
+// Update alert status
+alertsRouter.patch('/:alertId', async (req, res) => {
+  try {
+    const { alertId } = req.params;
+    const { status } = req.body;
+
+    const alert = await Alert.findById(alertId);
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+
+    // Check permissions
+    if (alert.userId.toString() !== req.user._id.toString() && 
+        !['admin', 'analyst'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    alert.status = status;
+    if (status === 'acknowledged') {
+      alert.acknowledgedBy = req.user._id;
+      alert.acknowledgedAt = new Date();
+    } else if (status === 'resolved') {
+      alert.resolvedAt = new Date();
+    }
+
+    await alert.save();
+    await alert.populate('userId', 'username email');
+    await alert.populate('acknowledgedBy', 'username');
+
+    res.json(alert);
+
+  } catch (error) {
+    console.error('Update alert error:', error);
+    res.status(500).json({ error: 'Failed to update alert' });
+  }
+});
+
+// routes/sessions.js
+const sessionsRouter = express.Router();
+
+// Get sessions
+sessionsRouter.get('/', async (req, res) => {
+  try {
+    const { 
+      status = 'all',
+      limit = 20,
+      skip = 0,
+      userId 
+    } = req.query;
+
+    const query = {};
+
+    // Filter by user for non-admin users
+    if (!['admin', 'analyst'].includes(req.user.role)) {
+      query.userId = req.user._id;
+    } else if (userId) {
+      query.userId = userId;
+    }
+
+    if (status !== 'all') {
+      query.status = status;
+    }
+
+    const sessions = await Session.find(query)
+      .populate('userId', 'username email')
+      .sort({ startTime: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(skip));
+
+    const totalSessions = await Session.countDocuments(query);
+
+    res.json({
+      sessions,
+      pagination: {
+        total: totalSessions,
+        limit: parseInt(limit),
+        skip: parseInt(skip),
+        hasMore: totalSessions > (parseInt(skip) + parseInt(limit))
+      }
+    });
+
+  } catch (error) {
+    console.error('Get sessions error:', error);
+    res.status(500).json({ error: 'Failed to retrieve sessions' });
+  }
+});
+
+// Terminate session
+sessionsRouter.post('/:sessionId/terminate', requireRole(['admin', 'analyst']), async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+
+    const session = await Session.findOneAndUpdate(
+      { sessionId },
+      { 
+        status: 'terminated',
+        endTime: new Date()
+      },
+      { new: true }
+    );
+
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    // Emit termination event
+    req.io.to(`user-${session.userId}`).emit('session-terminated', {
+      sessionId,
+      reason: 'Administrative action',
+      timestamp: new Date()
+    });
+
+    res.json({
+      message: 'Session terminated successfully',
+      session
+    });
+
+  } catch (error) {
+    console.error('Terminate session error:', error);
+    res.status(500).json({ error: 'Failed to terminate session' });
+  }
+});
+
+// routes/users.js
+const usersRouter = express.Router();
+
+// Get user profile
+usersRouter.get('/profile', async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('-password');
+    res.json(user);
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ error: 'Failed to retrieve profile' });
+  }
+});
+
+// Update user profile
+usersRouter.patch('/profile', async (req, res) => {
+  try {
+    const allowedUpdates = ['profile', 'settings'];
+    const updates = {};
+
+    for (const field of allowedUpdates) {
+      if (req.body[field]) {
+        updates[field] = req.body[field];
+      }
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      { $set: updates },
+      { new: true, runValidators: true }
+    ).select('-password');
+
+    res.json(user);
+
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// Update consent settings
+usersRouter.patch('/consent', async (req, res) => {
+  try {
+    const { behavioralTracking, dataCollection } = req.body;
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      {
+        $set: {
+          'consent.behavioralTracking': behavioralTracking,
+          'consent.dataCollection': dataCollection,
+          'consent.consentDate': new Date()
+        }
+      },
+      { new: true }
+    ).select('-password');
+
+    res.json({
+      message: 'Consent settings updated',
+      consent: user.consent
+    });
+
+  } catch (error) {
+    console.error('Update consent error:', error);
+    res.status(500).json({ error: 'Failed to update consent' });
+  }
+});
+
+// Get all users (admin only)
+usersRouter.get('/', requireRole(['admin']), async (req, res) => {
+  try {
+    const { 
+      limit = 20,
+      skip = 0,
+      search = '',
+      role = 'all',
+      status = 'all'
+    } = req.query;
+
+    const query = {};
+
+    if (search) {
+      query.$or = [
+        { username: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    if (role !== 'all') {
+      query.role = role;
+    }
+
+    if (status === 'active') {
+      query.isActive = true;
+    } else if (status === 'inactive') {
+      query.isActive = false;
+    }
+
+    const users = await User.find(query)
+      .select('-password')
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(skip));
+
+    const totalUsers = await User.countDocuments(query);
+
+    res.json({
+      users,
+      pagination: {
+        total: totalUsers,
+        limit: parseInt(limit),
+        skip: parseInt(skip),
+        hasMore: totalUsers > (parseInt(skip) + parseInt(limit))
+      }
+    });
+
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({ error: 'Failed to retrieve users' });
+  }
+});
+
+// Update user status (admin only)
+usersRouter.patch('/:userId/status', requireRole(['admin']), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { isActive } = req.body;
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { isActive },
+      { new: true }
+    ).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      message: `User ${isActive ? 'activated' : 'deactivated'} successfully`,
+      user
+    });
+
+  } catch (error) {
+    console.error('Update user status error:', error);
+    res.status(500).json({ error: 'Failed to update user status' });
+  }
+});
+
+module.exports = {
+  dashboard: router,
+  alerts: alertsRouter,
+  sessions: sessionsRouter,
+  users: usersRouter
+};
