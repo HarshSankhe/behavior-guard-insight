@@ -1,0 +1,275 @@
+// models/User.js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const userSchema = new mongoose.Schema({
+  username: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    lowercase: true
+  },
+  password: {
+    type: String,
+    required: true,
+    minlength: 6
+  },
+  role: {
+    type: String,
+    enum: ['admin', 'user', 'analyst'],
+    default: 'user'
+  },
+  profile: {
+    firstName: String,
+    lastName: String,
+    department: String,
+    location: String
+  },
+  settings: {
+    emailAlerts: { type: Boolean, default: true },
+    riskThreshold: { type: Number, default: 70 },
+    dataRetention: { type: Number, default: 30 }
+  },
+  consent: {
+    behavioralTracking: { type: Boolean, default: false },
+    dataCollection: { type: Boolean, default: false },
+    consentDate: Date
+  },
+  lastLogin: Date,
+  isActive: { type: Boolean, default: true },
+  deviceFingerprints: [{
+    fingerprint: String,
+    lastSeen: Date,
+    trusted: { type: Boolean, default: false }
+  }]
+}, {
+  timestamps: true
+});
+
+// Hash password before saving
+userSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  
+  try {
+    const salt = await bcrypt.genSalt(12);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Compare password method
+userSchema.methods.comparePassword = async function(candidatePassword) {
+  return bcrypt.compare(candidatePassword, this.password);
+};
+
+// models/Event.js
+const eventSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  sessionId: {
+    type: String,
+    required: true
+  },
+  eventType: {
+    type: String,
+    enum: ['keystroke', 'mouse', 'application', 'network'],
+    required: true
+  },
+  timestamp: {
+    type: Date,
+    required: true
+  },
+  data: {
+    // Keystroke events
+    key: String,
+    holdTime: Number,
+    flightTime: Number,
+    
+    // Mouse events
+    x: Number,
+    y: Number,
+    clickType: String,
+    movementSpeed: Number,
+    
+    // Application events
+    applicationHash: String, // Hashed for privacy
+    action: String, // focus, blur, switch
+    duration: Number,
+    
+    // Network events
+    latency: Number,
+    endpoint: String,
+    status: String
+  },
+  processed: {
+    type: Boolean,
+    default: false
+  }
+}, {
+  timestamps: true
+});
+
+// Index for efficient queries
+eventSchema.index({ userId: 1, sessionId: 1, timestamp: -1 });
+eventSchema.index({ processed: 1 });
+
+// models/Session.js
+const sessionSchema = new mongoose.Schema({
+  sessionId: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  startTime: {
+    type: Date,
+    required: true
+  },
+  endTime: Date,
+  duration: Number, // in seconds
+  eventCount: {
+    type: Number,
+    default: 0
+  },
+  riskScores: [{
+    timestamp: Date,
+    score: Number,
+    factors: {
+      typing: Number,
+      mouse: Number,
+      application: Number,
+      network: Number
+    }
+  }],
+  averageRiskScore: Number,
+  maxRiskScore: Number,
+  deviceFingerprint: String,
+  ipAddress: String,
+  userAgent: String,
+  status: {
+    type: String,
+    enum: ['active', 'completed', 'terminated'],
+    default: 'active'
+  }
+}, {
+  timestamps: true
+});
+
+// models/Alert.js
+const alertSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  sessionId: String,
+  type: {
+    type: String,
+    enum: ['anomaly_detected', 'new_device', 'behavioral_deviation', 'suspicious_activity'],
+    required: true
+  },
+  severity: {
+    type: String,
+    enum: ['low', 'medium', 'high', 'critical'],
+    required: true
+  },
+  title: {
+    type: String,
+    required: true
+  },
+  description: {
+    type: String,
+    required: true
+  },
+  riskScore: Number,
+  metadata: {
+    deviceFingerprint: String,
+    ipAddress: String,
+    location: String,
+    factors: mongoose.Schema.Types.Mixed
+  },
+  status: {
+    type: String,
+    enum: ['open', 'acknowledged', 'resolved', 'false_positive'],
+    default: 'open'
+  },
+  acknowledgedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  acknowledgedAt: Date,
+  resolvedAt: Date
+}, {
+  timestamps: true
+});
+
+// models/RiskLog.js
+const riskLogSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  sessionId: {
+    type: String,
+    required: true
+  },
+  timestamp: {
+    type: Date,
+    required: true
+  },
+  riskScore: {
+    type: Number,
+    required: true,
+    min: 0,
+    max: 100
+  },
+  factors: {
+    typing: { type: Number, default: 0 },
+    mouse: { type: Number, default: 0 },
+    application: { type: Number, default: 0 },
+    network: { type: Number, default: 0 }
+  },
+  reconstructionError: Number,
+  modelUsed: {
+    type: String,
+    enum: ['user', 'global'],
+    default: 'global'
+  },
+  eventCount: Number
+}, {
+  timestamps: true
+});
+
+// Index for time-series queries
+riskLogSchema.index({ userId: 1, timestamp: -1 });
+riskLogSchema.index({ sessionId: 1, timestamp: -1 });
+
+const User = mongoose.model('User', userSchema);
+const Event = mongoose.model('Event', eventSchema);
+const Session = mongoose.model('Session', sessionSchema);
+const Alert = mongoose.model('Alert', alertSchema);
+const RiskLog = mongoose.model('RiskLog', riskLogSchema);
+
+module.exports = {
+  User,
+  Event,
+  Session,
+  Alert,
+  RiskLog
+};
