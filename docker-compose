@@ -1,0 +1,166 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:6.0
+    container_name: cyberguard-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password123
+      MONGO_INITDB_DATABASE: cyberguard
+    volumes:
+      - mongodb_data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - cyberguard-network
+
+  backend:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: cyberguard-backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      MONGODB_URI: mongodb://admin:password123@mongodb:27017/cyberguard?authSource=admin
+      JWT_SECRET: your-super-secret-jwt-key-change-this-in-production-minimum-256-bits
+      ML_SERVICE_URL: http://ml-service:8001
+      ML_API_KEY: your-ml-service-api-key-change-this
+      FRONTEND_URL: http://localhost:5173
+    depends_on:
+      - mongodb
+      - ml-service
+    networks:
+      - cyberguard-network
+    volumes:
+      - ./logs:/app/logs
+
+  ml-service:
+    build:
+      context: ./ml_service
+      dockerfile: Dockerfile
+    container_name: cyberguard-ml
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      ML_API_KEY: your-ml-service-api-key-change-this
+      HOST: 0.0.0.0
+      PORT: 8001
+    volumes:
+      - ml_models:/app/models
+      - ml_data:/app/data
+    networks:
+      - cyberguard-network
+
+volumes:
+  mongodb_data:
+  ml_models:
+  ml_data:
+
+networks:
+  cyberguard-network:
+    driver: bridge
+
+---
+# Dockerfile (for backend)
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy source code
+COPY . .
+
+# Create logs directory
+RUN mkdir -p logs
+
+# Expose port
+EXPOSE 5000
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# Change ownership
+RUN chown -R nodejs:nodejs /app
+USER nodejs
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node healthcheck.js
+
+# Start the application
+CMD ["npm", "start"]
+
+---
+# scripts/mongo-init.js
+db = db.getSiblingDB('cyberguard');
+
+db.createUser({
+  user: 'cyberguard',
+  pwd: 'cyberguard123',
+  roles: [
+    {
+      role: 'readWrite',
+      db: 'cyberguard'
+    }
+  ]
+});
+
+// Create indexes for better performance
+db.users.createIndex({ "username": 1 }, { unique: true });
+db.users.createIndex({ "email": 1 }, { unique: true });
+db.events.createIndex({ "userId": 1, "sessionId": 1, "timestamp": -1 });
+db.events.createIndex({ "processed": 1 });
+db.sessions.createIndex({ "userId": 1, "startTime": -1 });
+db.sessions.createIndex({ "sessionId": 1 }, { unique: true });
+db.alerts.createIndex({ "userId": 1, "createdAt": -1 });
+db.alerts.createIndex({ "severity": 1, "status": 1 });
+db.risklogs.createIndex({ "userId": 1, "timestamp": -1 });
+db.risklogs.createIndex({ "sessionId": 1, "timestamp": -1 });
+
+print('MongoDB initialization completed');
+
+---
+# healthcheck.js
+const http = require('http');
+
+const options = {
+  hostname: 'localhost',
+  port: process.env.PORT || 5000,
+  path: '/health',
+  method: 'GET',
+  timeout: 2000
+};
+
+const req = http.request(options, (res) => {
+  if (res.statusCode === 200) {
+    process.exit(0);
+  } else {
+    process.exit(1);
+  }
+});
+
+req.on('error', () => {
+  process.exit(1);
+});
+
+req.on('timeout', () => {
+  req.destroy();
+  process.exit(1);
+});
+
+req.end();
