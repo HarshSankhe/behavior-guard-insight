@@ -1,0 +1,327 @@
+// scripts/seedDatabase.js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+require('dotenv').config();
+
+const { User, Alert, Session, RiskLog, Event } = require('../models');
+
+const seedDatabase = async () => {
+  try {
+    console.log('🌱 Starting database seeding...');
+
+    // Connect to MongoDB
+    await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/cyberguard');
+    console.log('📦 Connected to MongoDB');
+
+    // Clear existing data (optional - comment out if you want to keep existing data)
+    await Promise.all([
+      User.deleteMany({}),
+      Alert.deleteMany({}),
+      Session.deleteMany({}),
+      RiskLog.deleteMany({}),
+      Event.deleteMany({})
+    ]);
+    console.log('🧹 Cleared existing data');
+
+    // Create default admin user
+    const adminUser = new User({
+      username: 'admin',
+      email: 'admin@cyberguard.com',
+      password: 'password123',
+      role: 'admin',
+      profile: {
+        firstName: 'System',
+        lastName: 'Administrator',
+        department: 'IT Security',
+        location: 'Headquarters'
+      },
+      settings: {
+        emailAlerts: true,
+        riskThreshold: 50,
+        dataRetention: 90
+      },
+      consent: {
+        behavioralTracking: true,
+        dataCollection: true,
+        consentDate: new Date()
+      },
+      isActive: true,
+      lastLogin: new Date()
+    });
+
+    await adminUser.save();
+    console.log('👤 Created admin user');
+
+    // Create sample users
+    const sampleUsers = [
+      {
+        username: 'john.doe',
+        email: 'john.doe@company.com',
+        password: 'password123',
+        role: 'user',
+        profile: {
+          firstName: 'John',
+          lastName: 'Doe',
+          department: 'Engineering',
+          location: 'New York'
+        }
+      },
+      {
+        username: 'jane.smith',
+        email: 'jane.smith@company.com',
+        password: 'password123',
+        role: 'analyst',
+        profile: {
+          firstName: 'Jane',
+          lastName: 'Smith',
+          department: 'Security',
+          location: 'San Francisco'
+        }
+      },
+      {
+        username: 'bob.wilson',
+        email: 'bob.wilson@company.com',
+        password: 'password123',
+        role: 'user',
+        profile: {
+          firstName: 'Bob',
+          lastName: 'Wilson',
+          department: 'Marketing',
+          location: 'Chicago'
+        }
+      }
+    ];
+
+    const users = [];
+    for (const userData of sampleUsers) {
+      const user = new User({
+        ...userData,
+        settings: {
+          emailAlerts: true,
+          riskThreshold: 70,
+          dataRetention: 30
+        },
+        consent: {
+          behavioralTracking: true,
+          dataCollection: true,
+          consentDate: new Date()
+        },
+        isActive: true,
+        lastLogin: new Date(Date.now() - Math.random() * 7 * 24 * 60 * 60 * 1000) // Random last login within 7 days
+      });
+      await user.save();
+      users.push(user);
+    }
+
+    console.log(`👥 Created ${users.length} sample users`);
+
+    // Create sample sessions
+    const sessions = [];
+    for (let i = 0; i < 10; i++) {
+      const user = users[Math.floor(Math.random() * users.length)];
+      const startTime = new Date(Date.now() - Math.random() * 24 * 60 * 60 * 1000); // Random within 24 hours
+      const duration = Math.floor(Math.random() * 3600) + 300; // 5 minutes to 1 hour
+
+      const session = new Session({
+        sessionId: `session_${Date.now()}_${i}`,
+        userId: user._id,
+        startTime,
+        endTime: new Date(startTime.getTime() + duration * 1000),
+        duration,
+        eventCount: Math.floor(Math.random() * 1000) + 50,
+        averageRiskScore: Math.floor(Math.random() * 80) + 10,
+        maxRiskScore: Math.floor(Math.random() * 100) + 50,
+        deviceFingerprint: `device_${Math.random().toString(36).substr(2, 9)}`,
+        ipAddress: `192.168.1.${Math.floor(Math.random() * 255)}`,
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        status: Math.random() > 0.3 ? 'completed' : 'active'
+      });
+
+      // Add risk scores to session
+      const riskScoreCount = Math.floor(Math.random() * 5) + 1;
+      for (let j = 0; j < riskScoreCount; j++) {
+        const timestamp = new Date(startTime.getTime() + (j * (duration * 1000)) / riskScoreCount);
+        const score = Math.floor(Math.random() * 100);
+        
+        session.riskScores.push({
+          timestamp,
+          score,
+          factors: {
+            typing: Math.floor(Math.random() * 30),
+            mouse: Math.floor(Math.random() * 25),
+            application: Math.floor(Math.random() * 25),
+            network: Math.floor(Math.random() * 20)
+          }
+        });
+      }
+
+      await session.save();
+      sessions.push(session);
+    }
+
+    console.log(`📊 Created ${sessions.length} sample sessions`);
+
+    // Create sample risk logs
+    const riskLogs = [];
+    for (const session of sessions) {
+      for (const riskScore of session.riskScores) {
+        const riskLog = new RiskLog({
+          userId: session.userId,
+          sessionId: session.sessionId,
+          timestamp: riskScore.timestamp,
+          riskScore: riskScore.score,
+          factors: riskScore.factors,
+          reconstructionError: Math.random() * 0.2,
+          modelUsed: Math.random() > 0.7 ? 'user' : 'global',
+          eventCount: Math.floor(Math.random() * 50) + 10
+        });
+        await riskLog.save();
+        riskLogs.push(riskLog);
+      }
+    }
+
+    console.log(`📈 Created ${riskLogs.length} risk log entries`);
+
+    // Create sample alerts
+    const alertTypes = ['anomaly_detected', 'new_device', 'behavioral_deviation', 'suspicious_activity'];
+    const severities = ['low', 'medium', 'high', 'critical'];
+    const alerts = [];
+
+    for (let i = 0; i < 15; i++) {
+      const user = users[Math.floor(Math.random() * users.length)];
+      const session = sessions.find(s => s.userId.toString() === user._id.toString());
+      const alertType = alertTypes[Math.floor(Math.random() * alertTypes.length)];
+      const severity = severities[Math.floor(Math.random() * severities.length)];
+
+      const alertTitles = {
+        'anomaly_detected': 'Behavioral Anomaly Detected',
+        'new_device': 'Login from New Device',
+        'behavioral_deviation': 'Unusual Behavior Pattern',
+        'suspicious_activity': 'Suspicious Activity Alert'
+      };
+
+      const alertDescriptions = {
+        'anomaly_detected': 'Unusual behavioral patterns detected in user activity',
+        'new_device': 'User logged in from an unrecognized device',
+        'behavioral_deviation': 'Significant deviation from normal behavioral baseline',
+        'suspicious_activity': 'High-risk activity patterns requiring immediate attention'
+      };
+
+      const alert = new Alert({
+        userId: user._id,
+        sessionId: session?.sessionId,
+        type: alertType,
+        severity,
+        title: alertTitles[alertType],
+        description: alertDescriptions[alertType],
+        riskScore: Math.floor(Math.random() * 100),
+        metadata: {
+          deviceFingerprint: `device_${Math.random().toString(36).substr(2, 9)}`,
+          ipAddress: `192.168.1.${Math.floor(Math.random() * 255)}`,
+          location: ['New York', 'San Francisco', 'Chicago', 'Miami'][Math.floor(Math.random() * 4)],
+          factors: {
+            typing: Math.random() * 30,
+            mouse: Math.random() * 25,
+            application: Math.random() * 25,
+            network: Math.random() * 20
+          }
+        },
+        status: ['open', 'acknowledged', 'resolved'][Math.floor(Math.random() * 3)],
+        createdAt: new Date(Date.now() - Math.random() * 7 * 24 * 60 * 60 * 1000) // Random within 7 days
+      });
+
+      if (alert.status === 'acknowledged') {
+        alert.acknowledgedBy = adminUser._id;
+        alert.acknowledgedAt = new Date(alert.createdAt.getTime() + Math.random() * 24 * 60 * 60 * 1000);
+      }
+
+      if (alert.status === 'resolved') {
+        alert.resolvedAt = new Date(alert.createdAt.getTime() + Math.random() * 48 * 60 * 60 * 1000);
+      }
+
+      await alert.save();
+      alerts.push(alert);
+    }
+
+    console.log(`🚨 Created ${alerts.length} sample alerts`);
+
+    // Create sample events
+    const eventTypes = ['keystroke', 'mouse', 'application', 'network'];
+    const events = [];
+
+    for (let i = 0; i < 100; i++) {
+      const user = users[Math.floor(Math.random() * users.length)];
+      const session = sessions.find(s => s.userId.toString() === user._id.toString());
+      const eventType = eventTypes[Math.floor(Math.random() * eventTypes.length)];
+      
+      let eventData = {};
+      switch (eventType) {
+        case 'keystroke':
+          eventData = {
+            key: String.fromCharCode(65 + Math.floor(Math.random() * 26)),
+            holdTime: Math.random() * 200 + 50,
+            flightTime: Math.random() * 100 + 20
+          };
+          break;
+        case 'mouse':
+          eventData = {
+            x: Math.floor(Math.random() * 1920),
+            y: Math.floor(Math.random() * 1080),
+            clickType: ['left', 'right', 'middle'][Math.floor(Math.random() * 3)],
+            movementSpeed: Math.random() * 1000 + 100
+          };
+          break;
+        case 'application':
+          eventData = {
+            applicationHash: `hash_${Math.random().toString(36).substr(2, 12)}`,
+            action: ['focus', 'blur', 'switch'][Math.floor(Math.random() * 3)],
+            duration: Math.random() * 60000 + 1000
+          };
+          break;
+        case 'network':
+          eventData = {
+            latency: Math.random() * 200 + 10,
+            endpoint: `api.company.com/endpoint${Math.floor(Math.random() * 10)}`,
+            status: ['200', '404', '500'][Math.floor(Math.random() * 3)]
+          };
+          break;
+      }
+
+      const event = new Event({
+        userId: user._id,
+        sessionId: session?.sessionId || `session_${Date.now()}_default`,
+        eventType,
+        timestamp: new Date(Date.now() - Math.random() * 24 * 60 * 60 * 1000),
+        data: eventData,
+        processed: Math.random() > 0.2 // 80% processed
+      });
+
+      await event.save();
+      events.push(event);
+    }
+
+    console.log(`⚡ Created ${events.length} sample events`);
+
+    console.log('\n🎉 Database seeding completed successfully!');
+    console.log('\n📝 Default login credentials:');
+    console.log('Username: admin');
+    console.log('Password: password123');
+    console.log('\nOther test users:');
+    console.log('- john.doe / password123 (user)');
+    console.log('- jane.smith / password123 (analyst)');
+    console.log('- bob.wilson / password123 (user)');
+
+    process.exit(0);
+
+  } catch (error) {
+    console.error('❌ Seeding error:', error);
+    process.exit(1);
+  }
+};
+
+// Run seeding if this file is executed directly
+if (require.main === module) {
+  seedDatabase();
+}
+
+module.exports = seedDatabase;
