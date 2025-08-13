@@ -1,0 +1,471 @@
+// utils/mlService.js - ML Service Interface
+const axios = require('axios');
+
+class MLServiceClient {
+  constructor() {
+    this.baseURL = process.env.ML_SERVICE_URL || 'http://localhost:8001';
+    this.apiKey = process.env.ML_API_KEY;
+    this.timeout = 5000;
+    
+    this.client = axios.create({
+      baseURL: this.baseURL,
+      timeout: this.timeout,
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    // Add request/response interceptors
+    this.client.interceptors.request.use(
+      (config) => {
+        console.log(`ML Service Request: ${config.method.toUpperCase()} ${config.url}`);
+        return config;
+      },
+      (error) => {
+        console.error('ML Service Request Error:', error.message);
+        return Promise.reject(error);
+      }
+    );
+
+    this.client.interceptors.response.use(
+      (response) => {
+        console.log(`ML Service Response: ${response.status} ${response.config.url}`);
+        return response;
+      },
+      (error) => {
+        console.error('ML Service Response Error:', error.message);
+        return Promise.reject(error);
+      }
+    );
+  }
+
+  // Check ML service health
+  async healthCheck() {
+    try {
+      const response = await this.client.get('/health');
+      return {
+        status: 'healthy',
+        data: response.data
+      };
+    } catch (error) {
+      return {
+        status: 'unhealthy',
+        error: error.message
+      };
+    }
+  }
+
+  // Perform risk inference
+  async inferRisk(userId, sessionId, events) {
+    try {
+      const response = await this.client.post('/infer', {
+        user_id: userId.toString(),
+        session_id: sessionId,
+        events: events.map(event => ({
+          event_type: event.eventType,
+          timestamp: event.timestamp.toISOString(),
+          data: event.data
+        }))
+      });
+
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('ML inference error:', error.message);
+      return {
+        success: false,
+        error: error.message,
+        fallback: true
+      };
+    }
+  }
+
+  // Trigger model training
+  async trainModel(userId, epochs = 50) {
+    try {
+      const response = await this.client.post('/train', {
+        user_id: userId.toString(),
+        epochs: epochs
+      });
+
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('ML training error:', error.message);
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  // Get model information
+  async getModelInfo(userId) {
+    try {
+      const response = await this.client.get(`/models/${userId}`);
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      if (error.response?.status === 404) {
+        return {
+          success: true,
+          data: {
+            userModel: null,
+            globalModel: true,
+            message: 'No user-specific model found, using global model'
+          }
+        };
+      }
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  // List available models
+  async listModels() {
+    try {
+      const response = await this.client.get('/models');
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+}
+
+// Create singleton instance
+const mlService = new MLServiceClient();
+
+module.exports = mlService;
+
+---
+
+// utils/riskCalculator.js - Fallback risk calculation
+class RiskCalculator {
+  
+  // Calculate risk score when ML service is unavailable
+  static calculateFallbackRisk(events) {
+    const factors = {
+      typing: 0,
+      mouse: 0,
+      application: 0,
+      network: 0
+    };
+
+    const eventsByType = events.reduce((acc, event) => {
+      acc[event.eventType] = acc[event.eventType] || [];
+      acc[event.eventType].push(event);
+      return acc;
+    }, {});
+
+    // Typing pattern analysis
+    if (eventsByType.keystroke && eventsByType.keystroke.length > 5) {
+      factors.typing = this.analyzeTypingPattern(eventsByType.keystroke);
+    }
+
+    // Mouse pattern analysis
+    if (eventsByType.mouse && eventsByType.mouse.length > 5) {
+      factors.mouse = this.analyzeMousePattern(eventsByType.mouse);
+    }
+
+    // Application usage analysis
+    if (eventsByType.application) {
+      factors.application = this.analyzeApplicationPattern(eventsByType.application);
+    }
+
+    // Network pattern analysis
+    if (eventsByType.network) {
+      factors.network = this.analyzeNetworkPattern(eventsByType.network);
+    }
+
+    const totalRisk = Math.min(100, factors.typing + factors.mouse + factors.application + factors.network);
+
+    return {
+      riskScore: totalRisk,
+      factors,
+      modelUsed: 'fallback',
+      reconstructionError: null
+    };
+  }
+
+  // Analyze typing patterns for anomalies
+  static analyzeTypingPattern(keystrokes) {
+    const holdTimes = keystrokes
+      .map(k => k.data.holdTime)
+      .filter(t => typeof t === 'number' && t > 0);
+    
+    const flightTimes = keystrokes
+      .map(k => k.data.flightTime)
+      .filter(t => typeof t === 'number' && t > 0);
+
+    if (holdTimes.length === 0 && flightTimes.length === 0) return 0;
+
+    let riskScore = 0;
+
+    // Analyze hold times
+    if (holdTimes.length > 0) {
+      const avgHoldTime = holdTimes.reduce((a, b) => a + b, 0) / holdTimes.length;
+      const holdVariance = this.calculateVariance(holdTimes, avgHoldTime);
+      
+      // High variance indicates irregular typing (possible bot or stress)
+      if (holdVariance > 1000) {
+        riskScore += Math.min(15, holdVariance / 200);
+      }
+      
+      // Extremely fast or slow typing
+      if (avgHoldTime < 30 || avgHoldTime > 300) {
+        riskScore += Math.min(10, Math.abs(avgHoldTime - 100) / 20);
+      }
+    }
+
+    // Analyze flight times
+    if (flightTimes.length > 0) {
+      const avgFlightTime = flightTimes.reduce((a, b) => a + b, 0) / flightTimes.length;
+      const flightVariance = this.calculateVariance(flightTimes, avgFlightTime);
+      
+      if (flightVariance > 500) {
+        riskScore += Math.min(10, flightVariance / 100);
+      }
+    }
+
+    return Math.min(30, riskScore);
+  }
+
+  // Analyze mouse movement patterns
+  static analyzeMousePattern(mouseEvents) {
+    const movements = mouseEvents.filter(e => 
+      typeof e.data.x === 'number' && 
+      typeof e.data.y === 'number' &&
+      typeof e.data.movementSpeed === 'number'
+    );
+
+    if (movements.length < 3) return 0;
+
+    let riskScore = 0;
+
+    // Analyze movement speeds
+    const speeds = movements.map(m => m.data.movementSpeed);
+    const avgSpeed = speeds.reduce((a, b) => a + b, 0) / speeds.length;
+    const speedVariance = this.calculateVariance(speeds, avgSpeed);
+
+    // Very consistent speeds might indicate automation
+    if (speedVariance < 10 && speeds.length > 10) {
+      riskScore += 15;
+    }
+
+    // Extremely fast movements
+    if (avgSpeed > 2000) {
+      riskScore += Math.min(10, (avgSpeed - 2000) / 200);
+    }
+
+    // Analyze click patterns
+    const clicks = mouseEvents.filter(e => e.data.clickType);
+    if (clicks.length > 0) {
+      const clickIntervals = [];
+      for (let i = 1; i < clicks.length; i++) {
+        const interval = new Date(clicks[i].timestamp) - new Date(clicks[i-1].timestamp);
+        clickIntervals.push(interval);
+      }
+      
+      if (clickIntervals.length > 5) {
+        const avgInterval = clickIntervals.reduce((a, b) => a + b, 0) / clickIntervals.length;
+        const intervalVariance = this.calculateVariance(clickIntervals, avgInterval);
+        
+        // Very regular clicking might be automated
+        if (intervalVariance < 1000 && avgInterval < 500) {
+          riskScore += 10;
+        }
+      }
+    }
+
+    return Math.min(25, riskScore);
+  }
+
+  // Analyze application usage patterns
+  static analyzeApplicationPattern(appEvents) {
+    if (appEvents.length === 0) return 0;
+
+    let riskScore = 0;
+
+    // Analyze context switches
+    const switches = appEvents.filter(e => e.data.action === 'switch');
+    if (switches.length > 0) {
+      // Very frequent app switching might indicate unusual behavior
+      const timeSpan = new Date(appEvents[appEvents.length - 1].timestamp) - 
+                      new Date(appEvents[0].timestamp);
+      const switchRate = switches.length / (timeSpan / 60000); // switches per minute
+      
+      if (switchRate > 5) { // More than 5 switches per minute
+        riskScore += Math.min(15, switchRate * 2);
+      }
+    }
+
+    // Analyze focus durations
+    const focusEvents = appEvents.filter(e => 
+      e.data.action === 'focus' && typeof e.data.duration === 'number'
+    );
+    
+    if (focusEvents.length > 0) {
+      const durations = focusEvents.map(e => e.data.duration);
+      const avgDuration = durations.reduce((a, b) => a + b, 0) / durations.length;
+      
+      // Very short focus times might indicate restlessness or automation
+      if (avgDuration < 5000) { // Less than 5 seconds average
+        riskScore += Math.min(10, (5000 - avgDuration) / 500);
+      }
+    }
+
+    return Math.min(25, riskScore);
+  }
+
+  // Analyze network patterns
+  static analyzeNetworkPattern(networkEvents) {
+    if (networkEvents.length === 0) return 0;
+
+    let riskScore = 0;
+
+    // Analyze latencies
+    const latencies = networkEvents
+      .map(e => e.data.latency)
+      .filter(l => typeof l === 'number');
+
+    if (latencies.length > 0) {
+      const avgLatency = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+      
+      // Unusually high latency might indicate VPN or proxy use
+      if (avgLatency > 500) {
+        riskScore += Math.min(10, (avgLatency - 500) / 100);
+      }
+      
+      // Very consistent latencies might indicate artificial conditions
+      const latencyVariance = this.calculateVariance(latencies, avgLatency);
+      if (latencyVariance < 5 && latencies.length > 10) {
+        riskScore += 8;
+      }
+    }
+
+    // Analyze error rates
+    const errorEvents = networkEvents.filter(e => 
+      e.data.status && !e.data.status.startsWith('2')
+    );
+    
+    if (networkEvents.length > 0) {
+      const errorRate = errorEvents.length / networkEvents.length;
+      if (errorRate > 0.3) { // More than 30% errors
+        riskScore += Math.min(10, errorRate * 20);
+      }
+    }
+
+    return Math.min(20, riskScore);
+  }
+
+  // Calculate variance
+  static calculateVariance(values, mean) {
+    if (values.length < 2) return 0;
+    const squaredDiffs = values.map(value => Math.pow(value - mean, 2));
+    return squaredDiffs.reduce((a, b) => a + b, 0) / values.length;
+  }
+
+  // Determine risk level based on score
+  static getRiskLevel(score) {
+    if (score >= 80) return 'critical';
+    if (score >= 60) return 'high';
+    if (score >= 40) return 'medium';
+    if (score >= 20) return 'low';
+    return 'normal';
+  }
+
+  // Get risk description
+  static getRiskDescription(score, factors) {
+    const level = this.getRiskLevel(score);
+    const topFactor = Object.keys(factors).reduce((a, b) => 
+      factors[a] > factors[b] ? a : b
+    );
+
+    const descriptions = {
+      critical: `Critical risk detected (${score}). Primary concern: ${topFactor} patterns`,
+      high: `High risk behavior observed (${score}). Focus on ${topFactor} anomalies`,
+      medium: `Moderate risk detected (${score}). Monitor ${topFactor} patterns`,
+      low: `Low risk activity (${score}). Minor ${topFactor} deviations`,
+      normal: `Normal behavior patterns (${score}). No significant anomalies`
+    };
+
+    return descriptions[level];
+  }
+}
+
+module.exports = RiskCalculator;
+
+---
+
+// middleware/validation.js - Input validation middleware
+const { body, param, query } = require('express-validator');
+
+const validateEventSubmission = [
+  body('events')
+    .isArray({ min: 1, max: 1000 })
+    .withMessage('Events must be an array with 1-1000 items'),
+  body('sessionId')
+    .isString()
+    .isLength({ min: 1, max: 100 })
+    .withMessage('Valid session ID required'),
+  body('events.*.eventType')
+    .isIn(['keystroke', 'mouse', 'application', 'network'])
+    .withMessage('Invalid event type'),
+  body('events.*.timestamp')
+    .isISO8601()
+    .withMessage('Valid ISO8601 timestamp required')
+];
+
+const validateUserRegistration = [
+  body('username')
+    .isLength({ min: 3, max: 30 })
+    .matches(/^[a-zA-Z0-9._-]+$/)
+    .withMessage('Username must be 3-30 characters, alphanumeric with .-_ allowed'),
+  body('email')
+    .isEmail()
+    .normalizeEmail()
+    .withMessage('Valid email address required'),
+  body('password')
+    .isLength({ min: 8 })
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
+    .withMessage('Password must be 8+ chars with uppercase, lowercase, and number')
+];
+
+const validatePagination = [
+  query('limit')
+    .optional()
+    .isInt({ min: 1, max: 1000 })
+    .withMessage('Limit must be 1-1000'),
+  query('skip')
+    .optional()
+    .isInt({ min: 0 })
+    .withMessage('Skip must be >= 0')
+];
+
+const validateObjectId = (field) => [
+  param(field)
+    .isMongoId()
+    .withMessage(`${field} must be a valid ObjectId`)
+];
+
+module.exports = {
+  validateEventSubmission,
+  validateUserRegistration,
+  validatePagination,
+  validateObjectId
+};
