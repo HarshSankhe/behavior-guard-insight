@@ -1,0 +1,384 @@
+// Update the server.js file to properly import the route modules
+
+// Import routes (updated imports)
+const authRoutes = require('./routes/auth');
+const eventRoutes = require('./routes/events');
+const riskRoutes = require('./routes/risk');
+const { dashboard: dashboardRoutes, alerts: alertRoutes, sessions: sessionRoutes, users: userRoutes } = require('./routes/dashboard');
+
+// The rest of server.js remains the same...
+
+---
+
+// Create separate route files for better organization
+// routes/alerts.js
+const express = require('express');
+const { Alert } = require('../models');
+const { requireRole } = require('../middleware/auth');
+
+const router = express.Router();
+
+// Get alerts
+router.get('/', async (req, res) => {
+  try {
+    const { 
+      status = 'all', 
+      severity = 'all',
+      limit = 20,
+      skip = 0 
+    } = req.query;
+
+    const query = {};
+    
+    // Filter by user for non-admin users
+    if (!['admin', 'analyst'].includes(req.user.role)) {
+      query.userId = req.user._id;
+    }
+
+    if (status !== 'all') {
+      query.status = status;
+    }
+
+    if (severity !== 'all') {
+      query.severity = severity;
+    }
+
+    const alerts = await Alert.find(query)
+      .populate('userId', 'username email')
+      .populate('acknowledgedBy', 'username')
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(skip));
+
+    const totalAlerts = await Alert.countDocuments(query);
+
+    res.json({
+      alerts,
+      pagination: {
+        total: totalAlerts,
+        limit: parseInt(limit),
+        skip: parseInt(skip),
+        hasMore: totalAlerts > (parseInt(skip) + parseInt(limit))
+      }
+    });
+
+  } catch (error) {
+    console.error('Get alerts error:', error);
+    res.status(500).json({ error: 'Failed to retrieve alerts' });
+  }
+});
+
+// Create manual alert
+router.post('/', requireRole(['admin', 'analyst']), async (req, res) => {
+  try {
+    const { userId, type, severity, title, description, metadata } = req.body;
+
+    const alert = new Alert({
+      userId,
+      type: type || 'manual',
+      severity,
+      title,
+      description,
+      metadata
+    });
+
+    await alert.save();
+    await alert.populate('userId', 'username email');
+
+    res.status(201).json(alert);
+
+  } catch (error) {
+    console.error('Create alert error:', error);
+    res.status(500).json({ error: 'Failed to create alert' });
+  }
+});
+
+// Update alert status
+router.patch('/:alertId', async (req, res) => {
+  try {
+    const { alertId } = req.params;
+    const { status } = req.body;
+
+    const alert = await Alert.findById(alertId);
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+
+    // Check permissions
+    if (alert.userId.toString() !== req.user._id.toString() && 
+        !['admin', 'analyst'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    alert.status = status;
+    if (status === 'acknowledged') {
+      alert.acknowledgedBy = req.user._id;
+      alert.acknowledgedAt = new Date();
+    } else if (status === 'resolved') {
+      alert.resolvedAt = new Date();
+    }
+
+    await alert.save();
+    await alert.populate('userId', 'username email');
+    await alert.populate('acknowledgedBy', 'username');
+
+    res.json(alert);
+
+  } catch (error) {
+    console.error('Update alert error:', error);
+    res.status(500).json({ error: 'Failed to update alert' });
+  }
+});
+
+module.exports = router;
+
+---
+
+// routes/sessions.js
+const express = require('express');
+const { Session } = require('../models');
+const { requireRole } = require('../middleware/auth');
+
+const router = express.Router();
+
+// Get sessions
+router.get('/', async (req, res) => {
+  try {
+    const { 
+      status = 'all',
+      limit = 20,
+      skip = 0,
+      userId 
+    } = req.query;
+
+    const query = {};
+
+    // Filter by user for non-admin users
+    if (!['admin', 'analyst'].includes(req.user.role)) {
+      query.userId = req.user._id;
+    } else if (userId) {
+      query.userId = userId;
+    }
+
+    if (status !== 'all') {
+      query.status = status;
+    }
+
+    const sessions = await Session.find(query)
+      .populate('userId', 'username email')
+      .sort({ startTime: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(skip));
+
+    const totalSessions = await Session.countDocuments(query);
+
+    res.json({
+      sessions,
+      pagination: {
+        total: totalSessions,
+        limit: parseInt(limit),
+        skip: parseInt(skip),
+        hasMore: totalSessions > (parseInt(skip) + parseInt(limit))
+      }
+    });
+
+  } catch (error) {
+    console.error('Get sessions error:', error);
+    res.status(500).json({ error: 'Failed to retrieve sessions' });
+  }
+});
+
+// Terminate session
+router.post('/:sessionId/terminate', requireRole(['admin', 'analyst']), async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+
+    const session = await Session.findOneAndUpdate(
+      { sessionId },
+      { 
+        status: 'terminated',
+        endTime: new Date()
+      },
+      { new: true }
+    );
+
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    // Emit termination event
+    req.io.to(`user-${session.userId}`).emit('session-terminated', {
+      sessionId,
+      reason: 'Administrative action',
+      timestamp: new Date()
+    });
+
+    res.json({
+      message: 'Session terminated successfully',
+      session
+    });
+
+  } catch (error) {
+    console.error('Terminate session error:', error);
+    res.status(500).json({ error: 'Failed to terminate session' });
+  }
+});
+
+module.exports = router;
+
+---
+
+// routes/users.js
+const express = require('express');
+const { User } = require('../models');
+const { requireRole } = require('../middleware/auth');
+
+const router = express.Router();
+
+// Get user profile
+router.get('/profile', async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('-password');
+    res.json(user);
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ error: 'Failed to retrieve profile' });
+  }
+});
+
+// Update user profile
+router.patch('/profile', async (req, res) => {
+  try {
+    const allowedUpdates = ['profile', 'settings'];
+    const updates = {};
+
+    for (const field of allowedUpdates) {
+      if (req.body[field]) {
+        updates[field] = req.body[field];
+      }
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      { $set: updates },
+      { new: true, runValidators: true }
+    ).select('-password');
+
+    res.json(user);
+
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// Update consent settings
+router.patch('/consent', async (req, res) => {
+  try {
+    const { behavioralTracking, dataCollection } = req.body;
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      {
+        $set: {
+          'consent.behavioralTracking': behavioralTracking,
+          'consent.dataCollection': dataCollection,
+          'consent.consentDate': new Date()
+        }
+      },
+      { new: true }
+    ).select('-password');
+
+    res.json({
+      message: 'Consent settings updated',
+      consent: user.consent
+    });
+
+  } catch (error) {
+    console.error('Update consent error:', error);
+    res.status(500).json({ error: 'Failed to update consent' });
+  }
+});
+
+// Get all users (admin only)
+router.get('/', requireRole(['admin']), async (req, res) => {
+  try {
+    const { 
+      limit = 20,
+      skip = 0,
+      search = '',
+      role = 'all',
+      status = 'all'
+    } = req.query;
+
+    const query = {};
+
+    if (search) {
+      query.$or = [
+        { username: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    if (role !== 'all') {
+      query.role = role;
+    }
+
+    if (status === 'active') {
+      query.isActive = true;
+    } else if (status === 'inactive') {
+      query.isActive = false;
+    }
+
+    const users = await User.find(query)
+      .select('-password')
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(skip));
+
+    const totalUsers = await User.countDocuments(query);
+
+    res.json({
+      users,
+      pagination: {
+        total: totalUsers,
+        limit: parseInt(limit),
+        skip: parseInt(skip),
+        hasMore: totalUsers > (parseInt(skip) + parseInt(limit))
+      }
+    });
+
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({ error: 'Failed to retrieve users' });
+  }
+});
+
+// Update user status (admin only)
+router.patch('/:userId/status', requireRole(['admin']), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { isActive } = req.body;
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { isActive },
+      { new: true }
+    ).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      message: `User ${isActive ? 'activated' : 'deactivated'} successfully`,
+      user
+    });
+
+  } catch (error) {
+    console.error('Update user status error:', error);
+    res.status(500).json({ error: 'Failed to update user status' });
+  }
+});
+
+module.exports = router;
