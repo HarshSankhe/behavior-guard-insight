@@ -1,0 +1,230 @@
+// routes/auth.js
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { body, validationResult } = require('express-validator');
+const { User } = require('../models');
+const { authMiddleware } = require('../middleware/auth');
+
+const router = express.Router();
+
+// Generate device fingerprint
+const generateDeviceFingerprint = (req) => {
+  const userAgent = req.get('User-Agent') || '';
+  const acceptLanguage = req.get('Accept-Language') || '';
+  const acceptEncoding = req.get('Accept-Encoding') || '';
+  
+  return crypto.createHash('sha256')
+    .update(userAgent + acceptLanguage + acceptEncoding)
+    .digest('hex');
+};
+
+// Login
+router.post('/login', [
+  body('username').notEmpty().withMessage('Username is required'),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { username, password } = req.body;
+
+    // Find user by username or email
+    const user = await User.findOne({
+      $or: [{ username }, { email: username }]
+    });
+
+    if (!user || !user.isActive) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const isPasswordValid = await user.comparePassword(password);
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Generate device fingerprint
+    const deviceFingerprint = generateDeviceFingerprint(req);
+    
+    // Check if device is known
+    const knownDevice = user.deviceFingerprints.find(
+      device => device.fingerprint === deviceFingerprint
+    );
+
+    if (!knownDevice) {
+      // Add new device fingerprint
+      user.deviceFingerprints.push({
+        fingerprint: deviceFingerprint,
+        lastSeen: new Date(),
+        trusted: false
+      });
+      
+      // Create alert for new device
+      const { Alert } = require('../models');
+      await Alert.create({
+        userId: user._id,
+        type: 'new_device',
+        severity: 'medium',
+        title: 'Login from New Device',
+        description: `Login detected from unrecognized device: ${req.get('User-Agent')}`,
+        metadata: {
+          deviceFingerprint,
+          ipAddress: req.ip,
+          userAgent: req.get('User-Agent')
+        }
+      });
+    } else {
+      // Update last seen
+      knownDevice.lastSeen = new Date();
+    }
+
+    // Update last login
+    user.lastLogin = new Date();
+    await user.save();
+
+    // Generate JWT
+    const token = jwt.sign(
+      { 
+        userId: user._id,
+        username: user.username,
+        role: user.role 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        profile: user.profile,
+        settings: user.settings,
+        lastLogin: user.lastLogin
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Register (for development)
+router.post('/register', [
+  body('username').isLength({ min: 3 }).withMessage('Username must be at least 3 characters'),
+  body('email').isEmail().withMessage('Valid email is required'),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { username, email, password, role = 'user' } = req.body;
+
+    const existingUser = await User.findOne({
+      $or: [{ username }, { email }]
+    });
+
+    if (existingUser) {
+      return res.status(400).json({ error: 'Username or email already exists' });
+    }
+
+    const user = new User({
+      username,
+      email,
+      password,
+      role,
+      consent: {
+        behavioralTracking: true,
+        dataCollection: true,
+        consentDate: new Date()
+      }
+    });
+
+    await user.save();
+
+    // Generate JWT
+    const token = jwt.sign(
+      { 
+        userId: user._id,
+        username: user.username,
+        role: user.role 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.status(201).json({
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Verify token
+router.get('/verify', authMiddleware, (req, res) => {
+  res.json({
+    user: {
+      id: req.user._id,
+      username: req.user.username,
+      email: req.user.email,
+      role: req.user.role,
+      profile: req.user.profile,
+      settings: req.user.settings
+    }
+  });
+});
+
+// Logout
+router.post('/logout', authMiddleware, (req, res) => {
+  // In a production environment, you might want to blacklist the token
+  // For now, we'll just send a success response
+  res.json({ message: 'Logged out successfully' });
+});
+
+// Change password
+router.post('/change-password', [
+  authMiddleware,
+  body('currentPassword').notEmpty().withMessage('Current password is required'),
+  body('newPassword').isLength({ min: 6 }).withMessage('New password must be at least 6 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { currentPassword, newPassword } = req.body;
+    const user = await User.findById(req.user._id);
+
+    const isCurrentPasswordValid = await user.comparePassword(currentPassword);
+    if (!isCurrentPasswordValid) {
+      return res.status(400).json({ error: 'Current password is incorrect' });
+    }
+
+    user.password = newPassword;
+    await user.save();
+
+    res.json({ message: 'Password changed successfully' });
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+module.exports = router;
