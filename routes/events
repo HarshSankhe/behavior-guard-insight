@@ -1,0 +1,331 @@
+// routes/events.js
+const express = require('express');
+const { body, validationResult } = require('express-validator');
+const axios = require('axios');
+const { Event, Session, RiskLog } = require('../models');
+
+const router = express.Router();
+
+// ML Service client
+const mlServiceClient = axios.create({
+  baseURL: process.env.ML_SERVICE_URL || 'http://localhost:8001',
+  headers: {
+    'Authorization': `Bearer ${process.env.ML_API_KEY}`
+  },
+  timeout: 5000
+});
+
+// Submit behavioral events batch
+router.post('/', [
+  body('events').isArray().withMessage('Events must be an array'),
+  body('sessionId').notEmpty().withMessage('Session ID is required'),
+  body('events.*.eventType').isIn(['keystroke', 'mouse', 'application', 'network'])
+    .withMessage('Invalid event type'),
+  body('events.*.timestamp').isISO8601().withMessage('Valid timestamp required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { events, sessionId } = req.body;
+    const userId = req.user._id;
+
+    // Validate session
+    let session = await Session.findOne({ sessionId, userId });
+    if (!session) {
+      // Create new session
+      session = new Session({
+        sessionId,
+        userId,
+        startTime: new Date(Math.min(...events.map(e => new Date(e.timestamp)))),
+        deviceFingerprint: req.get('X-Device-Fingerprint') || 'unknown',
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+    }
+
+    // Process and validate events
+    const validEvents = events.map(event => ({
+      userId,
+      sessionId,
+      eventType: event.eventType,
+      timestamp: new Date(event.timestamp),
+      data: validateEventData(event.eventType, event.data),
+      processed: false
+    }));
+
+    // Save events to database
+    const savedEvents = await Event.insertMany(validEvents);
+    
+    // Update session stats
+    session.eventCount += savedEvents.length;
+    session.endTime = new Date();
+    session.duration = Math.round((session.endTime - session.startTime) / 1000);
+    await session.save();
+
+    // Process events for risk analysis in background
+    processEventsForRisk(userId, sessionId, savedEvents, req.io).catch(error => {
+      console.error('Risk processing error:', error);
+    });
+
+    res.json({
+      message: 'Events processed successfully',
+      eventCount: savedEvents.length,
+      sessionId
+    });
+
+  } catch (error) {
+    console.error('Event ingestion error:', error);
+    res.status(500).json({ error: 'Failed to process events' });
+  }
+});
+
+// Get events for a session
+router.get('/:sessionId', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { limit = 100, skip = 0 } = req.query;
+    
+    const events = await Event.find({
+      userId: req.user._id,
+      sessionId
+    })
+    .sort({ timestamp: -1 })
+    .limit(parseInt(limit))
+    .skip(parseInt(skip));
+
+    const totalEvents = await Event.countDocuments({
+      userId: req.user._id,
+      sessionId
+    });
+
+    res.json({
+      events,
+      pagination: {
+        total: totalEvents,
+        limit: parseInt(limit),
+        skip: parseInt(skip),
+        hasMore: totalEvents > (parseInt(skip) + parseInt(limit))
+      }
+    });
+
+  } catch (error) {
+    console.error('Get events error:', error);
+    res.status(500).json({ error: 'Failed to retrieve events' });
+  }
+});
+
+// Validate event data based on event type
+function validateEventData(eventType, data) {
+  const validated = {};
+  
+  switch (eventType) {
+    case 'keystroke':
+      if (data.key) validated.key = String(data.key).substring(0, 10);
+      if (typeof data.holdTime === 'number') validated.holdTime = Math.max(0, data.holdTime);
+      if (typeof data.flightTime === 'number') validated.flightTime = Math.max(0, data.flightTime);
+      break;
+      
+    case 'mouse':
+      if (typeof data.x === 'number') validated.x = Math.round(data.x);
+      if (typeof data.y === 'number') validated.y = Math.round(data.y);
+      if (data.clickType) validated.clickType = String(data.clickType);
+      if (typeof data.movementSpeed === 'number') validated.movementSpeed = Math.max(0, data.movementSpeed);
+      break;
+      
+    case 'application':
+      if (data.applicationHash) validated.applicationHash = String(data.applicationHash);
+      if (data.action) validated.action = String(data.action);
+      if (typeof data.duration === 'number') validated.duration = Math.max(0, data.duration);
+      break;
+      
+    case 'network':
+      if (typeof data.latency === 'number') validated.latency = Math.max(0, data.latency);
+      if (data.endpoint) validated.endpoint = String(data.endpoint).substring(0, 100);
+      if (data.status) validated.status = String(data.status);
+      break;
+  }
+  
+  return validated;
+}
+
+// Process events for risk analysis
+async function processEventsForRisk(userId, sessionId, events, io) {
+  try {
+    // Call ML service for risk inference
+    const response = await mlServiceClient.post('/infer', {
+      user_id: userId.toString(),
+      session_id: sessionId,
+      events: events.map(event => ({
+        event_type: event.eventType,
+        timestamp: event.timestamp.toISOString(),
+        data: event.data
+      }))
+    });
+
+    const { risk_score, factors, reconstruction_error, model_used } = response.data;
+
+    // Save risk log
+    const riskLog = new RiskLog({
+      userId,
+      sessionId,
+      timestamp: new Date(),
+      riskScore: risk_score,
+      factors,
+      reconstructionError: reconstruction_error,
+      modelUsed: model_used,
+      eventCount: events.length
+    });
+    await riskLog.save();
+
+    // Update session with risk score
+    await Session.findOneAndUpdate(
+      { sessionId, userId },
+      {
+        $push: {
+          riskScores: {
+            timestamp: new Date(),
+            score: risk_score,
+            factors
+          }
+        },
+        $set: {
+          averageRiskScore: risk_score,
+          maxRiskScore: risk_score
+        }
+      }
+    );
+
+    // Check for high risk and create alerts
+    if (risk_score >= 80) {
+      const { Alert } = require('../models');
+      await Alert.create({
+        userId,
+        sessionId,
+        type: 'suspicious_activity',
+        severity: 'critical',
+        title: 'High Risk Activity Detected',
+        description: `Unusual behavioral patterns detected with risk score of ${risk_score}`,
+        riskScore: risk_score,
+        metadata: {
+          factors,
+          modelUsed: model_used
+        }
+      });
+
+      // Emit real-time alert
+      io.to(`user-${userId}`).emit('high-risk-alert', {
+        riskScore: risk_score,
+        sessionId,
+        timestamp: new Date()
+      });
+    } else if (risk_score >= 50) {
+      const { Alert } = require('../models');
+      await Alert.create({
+        userId,
+        sessionId,
+        type: 'behavioral_deviation',
+        severity: 'medium',
+        title: 'Behavioral Deviation Detected',
+        description: `Moderate deviation from normal behavioral patterns (score: ${risk_score})`,
+        riskScore: risk_score,
+        metadata: {
+          factors,
+          modelUsed: model_used
+        }
+      });
+    }
+
+    // Emit real-time risk update
+    io.to(`user-${userId}`).emit('risk-update', {
+      sessionId,
+      riskScore: risk_score,
+      factors,
+      timestamp: new Date()
+    });
+
+    // Mark events as processed
+    await Event.updateMany(
+      { _id: { $in: events.map(e => e._id) } },
+      { processed: true }
+    );
+
+  } catch (error) {
+    console.error('ML service error:', error.message);
+    // Fall back to basic risk calculation if ML service is unavailable
+    await fallbackRiskCalculation(userId, sessionId, events, io);
+  }
+}
+
+// Fallback risk calculation when ML service is unavailable
+async function fallbackRiskCalculation(userId, sessionId, events, io) {
+  try {
+    // Simple heuristic-based risk calculation
+    let riskScore = 0;
+    const factors = { typing: 0, mouse: 0, application: 0, network: 0 };
+
+    const eventsByType = events.reduce((acc, event) => {
+      acc[event.eventType] = acc[event.eventType] || [];
+      acc[event.eventType].push(event);
+      return acc;
+    }, {});
+
+    // Typing pattern analysis
+    if (eventsByType.keystroke) {
+      const holdTimes = eventsByType.keystroke
+        .map(e => e.data.holdTime)
+        .filter(t => typeof t === 'number');
+      
+      if (holdTimes.length > 0) {
+        const avgHoldTime = holdTimes.reduce((a, b) => a + b, 0) / holdTimes.length;
+        const variance = holdTimes.reduce((acc, t) => acc + Math.pow(t - avgHoldTime, 2), 0) / holdTimes.length;
+        
+        // High variance indicates irregular typing
+        if (variance > 1000) factors.typing = Math.min(30, variance / 100);
+      }
+    }
+
+    // Mouse pattern analysis
+    if (eventsByType.mouse) {
+      const movements = eventsByType.mouse.filter(e => e.data.movementSpeed);
+      if (movements.length > 0) {
+        const speeds = movements.map(e => e.data.movementSpeed);
+        const avgSpeed = speeds.reduce((a, b) => a + b, 0) / speeds.length;
+        
+        // Very fast or very slow mouse movements
+        if (avgSpeed > 1000 || avgSpeed < 10) {
+          factors.mouse = Math.min(25, Math.abs(avgSpeed - 500) / 20);
+        }
+      }
+    }
+
+    riskScore = factors.typing + factors.mouse + factors.application + factors.network;
+
+    const riskLog = new RiskLog({
+      userId,
+      sessionId,
+      timestamp: new Date(),
+      riskScore: Math.min(100, riskScore),
+      factors,
+      modelUsed: 'fallback',
+      eventCount: events.length
+    });
+    await riskLog.save();
+
+    // Emit fallback risk update
+    io.to(`user-${userId}`).emit('risk-update', {
+      sessionId,
+      riskScore: Math.min(100, riskScore),
+      factors,
+      timestamp: new Date(),
+      fallback: true
+    });
+
+  } catch (error) {
+    console.error('Fallback risk calculation error:', error);
+  }
+}
+
+module.exports = router;
