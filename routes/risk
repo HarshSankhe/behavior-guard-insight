@@ -1,0 +1,332 @@
+// routes/risk.js
+const express = require('express');
+const axios = require('axios');
+const { RiskLog, Session, User } = require('../models');
+const { requireRole } = require('../middleware/auth');
+
+const router = express.Router();
+
+// ML Service client
+const mlServiceClient = axios.create({
+  baseURL: process.env.ML_SERVICE_URL || 'http://localhost:8001',
+  headers: {
+    'Authorization': `Bearer ${process.env.ML_API_KEY}`
+  },
+  timeout: 5000
+});
+
+// Get latest risk score for a user
+router.get('/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Check if user can access this data
+    if (userId !== req.user._id.toString() && !['admin', 'analyst'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const latestRisk = await RiskLog.findOne({ userId })
+      .sort({ timestamp: -1 })
+      .limit(1);
+
+    if (!latestRisk) {
+      return res.json({
+        riskScore: 0,
+        factors: { typing: 0, mouse: 0, application: 0, network: 0 },
+        timestamp: new Date(),
+        modelUsed: 'none'
+      });
+    }
+
+    res.json({
+      riskScore: latestRisk.riskScore,
+      factors: latestRisk.factors,
+      timestamp: latestRisk.timestamp,
+      modelUsed: latestRisk.modelUsed,
+      reconstructionError: latestRisk.reconstructionError
+    });
+
+  } catch (error) {
+    console.error('Get risk score error:', error);
+    res.status(500).json({ error: 'Failed to retrieve risk score' });
+  }
+});
+
+// Get risk history for a user
+router.get('/:userId/history', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { 
+      limit = 100, 
+      skip = 0, 
+      timeframe = '24h',
+      sessionId 
+    } = req.query;
+    
+    // Check if user can access this data
+    if (userId !== req.user._id.toString() && !['admin', 'analyst'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Calculate time range
+    const timeRanges = {
+      '1h': 60 * 60 * 1000,
+      '24h': 24 * 60 * 60 * 1000,
+      '7d': 7 * 24 * 60 * 60 * 1000,
+      '30d': 30 * 24 * 60 * 60 * 1000
+    };
+
+    const timeRange = timeRanges[timeframe] || timeRanges['24h'];
+    const startTime = new Date(Date.now() - timeRange);
+
+    // Build query
+    const query = {
+      userId,
+      timestamp: { $gte: startTime }
+    };
+
+    if (sessionId) {
+      query.sessionId = sessionId;
+    }
+
+    const riskHistory = await RiskLog.find(query)
+      .sort({ timestamp: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(skip));
+
+    const totalRecords = await RiskLog.countDocuments(query);
+
+    // Calculate statistics
+    const riskScores = riskHistory.map(r => r.riskScore);
+    const stats = {
+      average: riskScores.length ? riskScores.reduce((a, b) => a + b, 0) / riskScores.length : 0,
+      max: riskScores.length ? Math.max(...riskScores) : 0,
+      min: riskScores.length ? Math.min(...riskScores) : 0,
+      count: riskScores.length
+    };
+
+    res.json({
+      riskHistory,
+      statistics: stats,
+      pagination: {
+        total: totalRecords,
+        limit: parseInt(limit),
+        skip: parseInt(skip),
+        hasMore: totalRecords > (parseInt(skip) + parseInt(limit))
+      }
+    });
+
+  } catch (error) {
+    console.error('Get risk history error:', error);
+    res.status(500).json({ error: 'Failed to retrieve risk history' });
+  }
+});
+
+// Get risk trends (admin/analyst only)
+router.get('/trends/overview', requireRole(['admin', 'analyst']), async (req, res) => {
+  try {
+    const { timeframe = '24h' } = req.query;
+    
+    const timeRanges = {
+      '1h': 60 * 60 * 1000,
+      '24h': 24 * 60 * 60 * 1000,
+      '7d': 7 * 24 * 60 * 60 * 1000,
+      '30d': 30 * 24 * 60 * 60 * 1000
+    };
+
+    const timeRange = timeRanges[timeframe] || timeRanges['24h'];
+    const startTime = new Date(Date.now() - timeRange);
+
+    // Aggregate risk data
+    const pipeline = [
+      {
+        $match: {
+          timestamp: { $gte: startTime }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            userId: '$userId',
+            hour: { $dateToString: { format: '%Y-%m-%d-%H', date: '$timestamp' } }
+          },
+          avgRiskScore: { $avg: '$riskScore' },
+          maxRiskScore: { $max: '$riskScore' },
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $group: {
+          _id: '$_id.hour',
+          avgRisk: { $avg: '$avgRiskScore' },
+          maxRisk: { $max: '$maxRiskScore' },
+          userCount: { $sum: 1 },
+          totalEvents: { $sum: '$count' }
+        }
+      },
+      {
+        $sort: { _id: 1 }
+      }
+    ];
+
+    const trends = await RiskLog.aggregate(pipeline);
+
+    // Get high-risk users
+    const highRiskUsers = await RiskLog.aggregate([
+      {
+        $match: {
+          timestamp: { $gte: startTime },
+          riskScore: { $gte: 70 }
+        }
+      },
+      {
+        $group: {
+          _id: '$userId',
+          avgRiskScore: { $avg: '$riskScore' },
+          maxRiskScore: { $max: '$riskScore' },
+          highRiskEvents: { $sum: 1 }
+        }
+      },
+      {
+        $sort: { avgRiskScore: -1 }
+      },
+      {
+        $limit: 10
+      },
+      {
+        $lookup: {
+          from: 'users',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'user'
+        }
+      }
+    ]);
+
+    res.json({
+      trends,
+      highRiskUsers,
+      summary: {
+        totalUsers: await User.countDocuments({ isActive: true }),
+        highRiskUsers: highRiskUsers.length,
+        timeframe
+      }
+    });
+
+  } catch (error) {
+    console.error('Get risk trends error:', error);
+    res.status(500).json({ error: 'Failed to retrieve risk trends' });
+  }
+});
+
+// Trigger model training for a user
+router.post('/train/:userId', requireRole(['admin', 'analyst']), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { epochs = 50 } = req.body;
+
+    // Verify user exists
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Check if user has enough data
+    const eventCount = await require('../models').Event.countDocuments({ userId });
+    if (eventCount < 100) {
+      return res.status(400).json({ 
+        error: 'Insufficient data for training',
+        currentEvents: eventCount,
+        requiredEvents: 100
+      });
+    }
+
+    // Call ML service to trigger training
+    try {
+      const response = await mlServiceClient.post('/train', {
+        user_id: userId,
+        epochs: parseInt(epochs)
+      });
+
+      res.json({
+        message: 'Model training initiated',
+        userId,
+        epochs,
+        trainingId: response.data.training_id || 'unknown'
+      });
+
+    } catch (mlError) {
+      console.error('ML service training error:', mlError.message);
+      res.status(503).json({ 
+        error: 'ML service unavailable',
+        details: mlError.message
+      });
+    }
+
+  } catch (error) {
+    console.error('Trigger training error:', error);
+    res.status(500).json({ error: 'Failed to initiate training' });
+  }
+});
+
+// Get model information
+router.get('/models/:userId', requireRole(['admin', 'analyst']), async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    try {
+      const response = await mlServiceClient.get(`/models/${userId}`);
+      res.json(response.data);
+    } catch (mlError) {
+      if (mlError.response?.status === 404) {
+        res.json({
+          userModel: null,
+          globalModel: true,
+          message: 'No user-specific model found, using global model'
+        });
+      } else {
+        throw mlError;
+      }
+    }
+
+  } catch (error) {
+    console.error('Get model info error:', error);
+    res.status(500).json({ error: 'Failed to retrieve model information' });
+  }
+});
+
+// Real-time risk monitoring endpoint
+router.get('/monitor/realtime', requireRole(['admin', 'analyst']), async (req, res) => {
+  try {
+    const { limit = 20 } = req.query;
+
+    // Get recent high-risk events
+    const recentHighRisk = await RiskLog.find({
+      riskScore: { $gte: 50 },
+      timestamp: { $gte: new Date(Date.now() - 60 * 60 * 1000) } // Last hour
+    })
+    .sort({ timestamp: -1 })
+    .limit(parseInt(limit))
+    .populate('userId', 'username email');
+
+    // Get active sessions with risk data
+    const activeSessions = await Session.find({
+      status: 'active',
+      endTime: { $gte: new Date(Date.now() - 30 * 60 * 1000) } // Last 30 minutes
+    })
+    .populate('userId', 'username email')
+    .select('sessionId userId riskScores averageRiskScore maxRiskScore startTime');
+
+    res.json({
+      recentHighRisk,
+      activeSessions,
+      timestamp: new Date()
+    });
+
+  } catch (error) {
+    console.error('Real-time monitoring error:', error);
+    res.status(500).json({ error: 'Failed to retrieve monitoring data' });
+  }
+});
+
+module.exports = router;
